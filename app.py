@@ -1,15 +1,44 @@
-import re
-from io import BytesIO
-from typing import Tuple, List
-from functools import lru_cache
-from langchain.docstore.document import Document
-from langchain_openai import OpenAIEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from pydantic import BaseModel, Field
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from openai import OpenAI
 from dotenv import load_dotenv
+from pydantic import BaseModel
+from typing import List, Optional, Set
 import os
+import random
+import json
+from urllib.parse import unquote
+from threading import Thread
+import re
+
+app = Flask(_name_)
+CORS(app)
+load_dotenv()
+
+api_key = os.getenv('OPENAI_API_KEY')
+client = OpenAI(api_key=api_key)
+
+class QuizQuestion(BaseModel):
+    question: str
+    options: List[str]
+    answer: str
+    explanation: str
+
+# Global variables
+question_cache: List[QuizQuestion] = []
+used_questions: Set[str] = set()
+current_topic: str = ""
+
+def print_question(q: QuizQuestion, index: int):
+    print(f"\nQuestion {index}:")
+    print("=" * 50)
+    print(f"Q: {q.question}")
+    print("\nOptions:")
+    for i, opt in enumerate(q.options):
+        print(f"{chr(65+i)}) {opt}")
+    print(f"\nCorrect Answer: {q.answer}")
+    print(f"Explanation: {q.explanation}")
+    print("-" * 50)
 
 def read_chapter_content(file_path: str) -> str:
     try:
@@ -25,7 +54,7 @@ def calculate_accuracy(text_content: str, questions: list) -> float:
         relevant_count = 0
         
         for q in questions:
-            question_words = q['question'].lower().split()
+            question_words = q.question.lower().split()
             for word in question_words:
                 if len(word) > 3 and word in text_content.lower():
                     relevant_count += 1
@@ -36,7 +65,10 @@ def calculate_accuracy(text_content: str, questions: list) -> float:
         print(f"Error calculating accuracy: {str(e)}")
         return 0.0
 
-def generate_quiz_questions(text_content: str, client: OpenAI, model: str):
+def generate_quiz_questions(text_content: str = None, topic: str = None, num_questions: int = 5) -> Optional[List[QuizQuestion]]:
+    print("\nGenerating Questions...")
+    print("=" * 50)
+
     system_prompt = """Generate 5 thought-provoking multiple choice questions that enhance students' cognitive abilities and IQ. Include questions that:
     1. Test logical reasoning and pattern recognition
     2. Require application of concepts in novel situations
@@ -45,172 +77,160 @@ def generate_quiz_questions(text_content: str, client: OpenAI, model: str):
     5. Integrate multiple concepts and ideas
     6. Challenge students to think beyond memorization
     
-    Format each question as:
-    Question N: [Analytical question that improves cognitive skills]
-    A) [Option]
-    B) [Option]
-    C) [Option]
-    D) [Option]
-    Answer: [Letter]. [Full correct answer]
-    Explanation: [Detailed explanation linking concepts and reasoning]"""
+    The response must be a JSON object with the following structure:
+    {
+        "questions": [
+            {
+                "question": "Question text",
+                "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
+                "answer": "Correct option text",
+                "explanation": "Detailed explanation"
+            }
+        ]
+    }"""
 
-    query = f"Content:\n{text_content}\n\nCreate questions that enhance logical thinking and problem-solving abilities using the specified format."
-
+    if text_content:
+        user_prompt = f"Content:\n{text_content}\n\nCreate questions that enhance logical thinking and problem-solving abilities using the specified format."
+    else:
+        user_prompt = f"Create {num_questions} questions about {topic} that enhance logical thinking and problem-solving abilities using the specified format."
 
     try:
         completion = client.chat.completions.create(
-            model=model,
+            model="gpt-4-turbo-preview",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": query},
+                {"role": "user", "content": user_prompt}
             ],
             temperature=0.7,
-            max_tokens=2000
+            response_format={"type": "json_object"}
         )
-        
-        response = completion.choices[0].message.content
-        return parse_quiz_response(response)
+
+        response_text = completion.choices[0].message.content
+        response_data = json.loads(response_text)
+
+        processed_questions = []
+        for q in response_data["questions"]:
+            if not all(k in q for k in ["question", "options", "answer", "explanation"]):
+                continue
+            
+            if len(q["options"]) != 4:
+                continue
+
+            if q["question"] in used_questions:
+                print(f"Duplicate question detected: {q['question']}")
+                continue
+
+            question = QuizQuestion(
+                question=q["question"],
+                options=q["options"],
+                answer=q["answer"],
+                explanation=q["explanation"]
+            )
+
+            if question.answer not in question.options:
+                continue
+
+            random.shuffle(question.options)
+            used_questions.add(question.question)
+            processed_questions.append(question)
+
+        # Print generated questions
+        print("\nGenerated Questions:")
+        for i, q in enumerate(processed_questions, 1):
+            print_question(q, i)
+
+        return processed_questions
+
     except Exception as e:
-        print(f"Error in question generation: {str(e)}")
+        print(f"Error in generate_quiz_questions: {str(e)}")
         return None
 
-def parse_quiz_response(response: str) -> dict:
-    questions = []
-    current_question = None
+def preload_questions(standard: str, subject: str, chapter: str, topic: str):
+    global question_cache, current_topic, used_questions
     
-    for line in response.split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-
-        if line.startswith(('Question', 'Q')):
-            if current_question is not None:
-                questions.append(current_question)
-            
-            current_question = {
-                'question': line.split(':', 1)[1].strip() if ':' in line else line,
-                'options': [],
-                'answer': '',
-                'full_answer': '',
-                'explanation': ''
-            }
-            
-        elif any(line.startswith(f"{letter})") for letter in ['A', 'B', 'C', 'D']):
-            option_letter = line[0]
-            option_text = line[2:].strip()
-            current_question['options'].append(option_text)
-            current_question[f'option_{option_letter}'] = option_text
-
-        elif line.startswith('Answer:'):
-            answer_text = line.split(':', 1)[1].strip()
-            # Extract letter and full answer
-            match = re.match(r'([A-D])[.).]\s*(.*)', answer_text)
-            if match:
-                letter, full_answer = match.groups()
-                current_question['answer'] = letter
-                current_question['full_answer'] = full_answer
-            else:
-                current_question['answer'] = answer_text[0] if answer_text else ''
-                current_question['full_answer'] = answer_text
-
-        elif line.startswith('Explanation:'):
-            current_question['explanation'] = line.split(':', 1)[1].strip()
-
-    if current_question is not None:
-        questions.append(current_question)
-
-    # Validate and clean up questions
-    for q in questions:
-        if not q.get('answer') or q['answer'] not in 'ABCD':
-            q['answer'] = 'Not specified'
-            q['full_answer'] = 'Answer format error'
-        if not q.get('explanation'):
-            q['explanation'] = 'No explanation provided'
-        if len(q.get('options', [])) != 4:
-            q['options'] = ['Option A', 'Option B', 'Option C', 'Option D']
-
-    return {'questions': questions, 'confidence': 0.9}
-
-def generate_quiz():
-    print("\nQuiz Generator")
-    print("-" * 50)
+    if topic != current_topic:
+        question_cache.clear()
+        used_questions.clear()
+        current_topic = topic
     
-    # Input validation
-    while True:
-        standard = input("Enter standard (e.g., 6): ").strip()
-        if standard.isdigit():
-            break
-        print("Please enter a valid standard number")
-
-    while True:
-        subject = input("Enter subject (e.g., Maths): ").strip()
-        if subject:
-            break
-        print("Please enter a valid subject")
-
-    while True:
-        chapter = input("Enter chapter number (e.g., 1): ").strip()
-        if chapter.isdigit():
-            break
-        print("Please enter a valid chapter number")
-
-    load_dotenv()
-    api_key = os.getenv('OPENAI_API_KEY')
+    file_path = rf"D:\bck\schoolbooks\{standard}\{subject}\{topic}.txt" 
     
-    if not api_key:
-        print("Error: OpenAI API key not found in .env file")
-        return
-        
-    client = OpenAI(api_key=api_key)
-    file_path = f"/home/ec2-user/schoolbooks/{standard}th/{subject}/Chapter {chapter}.txt"  #/home/ec2-user/schoolbooks/6th/maths
+    print(f"\nPreloading questions for {subject} Chapter {topic} (Standard {standard})")
+    print("=" * 50)
     
-    if not os.path.exists(file_path):
-        print(f"Error: File not found: {file_path}")
-        return
-
-    try:
+    if os.path.exists(file_path):
         chapter_content = read_chapter_content(file_path)
-        if not chapter_content:
-            print("Error: Could not read chapter content")
-            return
+        if chapter_content:
+            questions = generate_quiz_questions(text_content=chapter_content)
+            if questions:
+                accuracy = calculate_accuracy(chapter_content, questions)
+                print(f"\nQuestion Generation Accuracy: {accuracy}%")
+                print("=" * 50)
+                question_cache.extend(questions)
+    else:
+        print(f"\nFile not found: {file_path}")
+        print("Generating questions based on topic instead...")
+        questions = generate_quiz_questions(topic=topic, num_questions=5)
+        if questions:
+            question_cache.extend(questions)
 
-        print(f"\nGenerating questions for {subject} Chapter {chapter} (Standard {standard})")
-        
-        result = generate_quiz_questions(
-            client=client, 
-            model="gpt-4-turbo-preview",
-            text_content=chapter_content
-        )
-
-        if not result:
-            print("Error: Failed to generate questions")
-            return
-
-        # Calculate accuracy
-        accuracy = calculate_accuracy(chapter_content, result['questions'])
-        print(f"\nQuestion Generation Accuracy: {accuracy}%")
-        print("=" * 50)
-
-        print("\nGenerated Quiz Questions:")
-        print("=" * 50)
-        for i, q in enumerate(result['questions'], 1):
-            print(f"\nQuestion {i}: {q['question']}")
-            print("\nOptions:")
-            for opt, option in zip(['A', 'B', 'C', 'D'], q['options']):
-                print(f"{opt}) {option}")
-            print(f"\nCorrect Answer: {q['answer']}. {q['full_answer']}")
-            print(f"Explanation: {q['explanation']}")
-            print("-" * 50)
-
-        print("\nQuiz generation completed!")
-
-    except Exception as e:
-        print(f"Error generating quiz: {str(e)}")
-
-if __name__ == "__main__":
+@app.route('/quiz/next', methods=['GET'])
+def get_next_questions():
     try:
-        generate_quiz()
-    except KeyboardInterrupt:
-        print("\nQuiz generation cancelled by user")
+        topic = unquote(request.args.get('topic', ''))
+        current_index = int(request.args.get('current_index', 0))
+        standard = request.args.get('standard', '')
+        subject = request.args.get('subject', '')
+        chapter = request.args.get('chapter', '')
+        
+        if not topic:
+            return jsonify({"error": "Missing topic parameter"}), 400
+
+        topic = topic.strip()
+        
+        print(f"\nProcessing request for topic: {topic}")
+        print(f"Current index: {current_index}")
+        print(f"\nProcessing request for subject: {subject}")
+        print(f"standard: {standard}")
+        
+        if current_index % 5 == 2 or len(question_cache) < 5:
+            Thread(target=preload_questions, args=(standard, subject, chapter, topic)).start()
+
+        if len(question_cache) < 5:
+            if standard and subject and chapter:
+                print(chapter)
+                file_path = f"D:/bck/schoolbooks/{standard}th/{subject}/Chapter {chapter}.txt"
+                if os.path.exists(file_path):
+                    chapter_content = read_chapter_content(file_path)
+                    questions = generate_quiz_questions(text_content=chapter_content)
+                else:
+                    print(chapter)
+                    questions = generate_quiz_questions(topic=topic, num_questions=5)
+            else:
+                questions = generate_quiz_questions(topic=topic, num_questions=5)
+                
+            if questions is None:
+                return jsonify({"error": "Failed to generate questions"}), 500
+        else:
+            questions = question_cache[:5]
+            del question_cache[:5]
+
+        return jsonify({
+            "questions": [q.model_dump() for q in questions],
+            "should_fetch": True
+        })
+
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
     except Exception as e:
-        print(f"\nAn unexpected error occurred: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
+
+if _name_ == '_main_':
+    print("\nStarting Quiz Generator Server...")
+    print("=" * 50)
+    CORS(app, resources={r"/": {"origins": ""}})
+    app.run(debug=True, port=5000, host='0.0.0.0')
