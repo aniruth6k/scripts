@@ -162,7 +162,7 @@ def generate_quiz():
         return
         
     client = OpenAI(api_key=api_key)
-    file_path = f"D:/bck/schoolbooks/{standard}th/{subject}/Chapter {chapter}.txt"
+    file_path = f"/home/ec2-user/schoolbooks/{standard}th/{subject}/Chapter {chapter}.txt"  #/home/ec2-user/schoolbooks/6th/maths
     
     if not os.path.exists(file_path):
         print(f"Error: File not found: {file_path}")
@@ -207,7 +207,7 @@ def generate_quiz():
     except Exception as e:
         print(f"Error generating quiz: {str(e)}")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     try:
         generate_quiz()
     except KeyboardInterrupt:
