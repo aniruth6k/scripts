@@ -203,8 +203,10 @@ def get_next_questions():
                 if os.path.exists(file_path):
                     chapter_content = read_chapter_content(file_path)
                     questions = generate_quiz_questions(text_content=chapter_content)
+                    print("file")
                 else:
                     print(chapter)
+                    print("ai")
                     questions = generate_quiz_questions(topic=topic, num_questions=5)
             else:
                 questions = generate_quiz_questions(topic=topic, num_questions=5)
@@ -233,4 +235,4 @@ if _name_ == '_main_':
     print("\nStarting Quiz Generator Server...")
     print("=" * 50)
     CORS(app, resources={r"/": {"origins": ""}})
-    app.run(debug=True, port=5000, host='0.0.0.0')
+    app.run(debug=True)
